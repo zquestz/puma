@@ -33,13 +33,16 @@ module Puma
       @app = app
       @events = events
 
-      @check, @notify = IO.pipe
-      @ios = [@check]
+      # @check, @notify = IO.pipe
+      @ios = [] # [@check]
 
       @running = false
 
       @min_threads = 0
       @max_threads = 16
+
+      @accept_thread_count = 1
+      @accept_threads = nil
 
       @thread = nil
       @thread_pool = nil
@@ -61,6 +64,8 @@ module Puma
       }
     end
 
+    attr_reader :ios, :thread_pool
+
     def add_tcp_listener(host, port)
       @ios << TCPServer.new(host, port)
     end
@@ -81,29 +86,13 @@ module Puma
         process_client(client)
       end
 
+      @accept_threads = @accept_thread_count.times.map do
+        AcceptThread.new(self).start
+      end
+
       @thread = Thread.new do
         begin
-          check = @check
-          sockets = @ios
-          pool = @thread_pool
-
-          while @running
-            begin
-              ios = IO.select sockets
-              ios.first.each do |sock|
-                if sock == check
-                  break if handle_check
-                else
-                  pool << sock.accept
-                end
-              end
-            rescue Errno::ECONNABORTED
-              # client closed the socket even before accept
-              client.close rescue nil
-            rescue Object => e
-              @events.unknown_error self, env, e, "Listen loop"
-            end
-          end
+          @accept_threads.each { |t| t.join }
           graceful_shutdown
         ensure
           @ios.each { |i| i.close }
@@ -113,16 +102,67 @@ module Puma
       return @thread
     end
 
-    def handle_check
-      cmd = @check.read(1) 
-
-      case cmd
-      when STOP_COMMAND
-        @running = false
-        return true
+    class AcceptThread
+      def initialize(server)
+        @running = true
+        @server = server
       end
 
-      return false
+      def start
+        read, @notify = IO.pipe
+
+        @thread = Thread.new do
+          begin
+            check = read
+            sockets = @server.ios + [check]
+            pool = @server.thread_pool
+
+            while @running
+              begin
+                ios = IO.select sockets
+                ios.first.each do |sock|
+                  if sock == check
+                    break if handle_check(check)
+                  else
+                    pool << sock.accept
+                  end
+                end
+              rescue Errno::ECONNABORTED
+                # client closed the socket even before accept
+                client.close rescue nil
+              rescue Object => e
+                @server.events.unknown_error self, e, "Listen loop"
+              end
+            end
+          ensure
+            read.close
+          end
+        end
+
+        self
+      end
+
+      def handle_check(check)
+        cmd = check.read(1) 
+
+        case cmd
+        when Const::STOP_COMMAND
+          @running = false
+          return true
+        end
+
+        return false
+      end
+
+      def halt(sync=false)
+        @running = false
+        @notify << Const::STOP_COMMAND
+        @thread.join if @thread and sync
+      end
+
+      def join
+        @thread.join
+      end
     end
 
     def process_client(client)
@@ -392,9 +432,9 @@ module Puma
     # Stops the acceptor thread and then causes the worker threads to finish
     # off the request queue before finally exiting.
     def stop(sync=false)
-      @notify << STOP_COMMAND
-
-      @thread.join if @thread && sync
+      return unless @accept_threads
+      @accept_threads.each { |t| t.halt(sync) }
+      @thread.join
     end
 
     def attempt_bonjour(name)

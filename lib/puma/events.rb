@@ -18,7 +18,7 @@ module Puma
       @stderr.puts "#{Time.now}: ENV: #{env.inspect}\n---\n"
     end
 
-    def unknown_error(server, env, error, kind="Unknown")
+    def unknown_error(server, error, kind="Unknown")
       if error.respond_to? :render
         error.render "#{Time.now}: #{kind} error", @stderr
       else
