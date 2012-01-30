@@ -47,29 +47,35 @@ module Puma
       end
 
       th = Thread.new do
-        todo = @todo
-        block = @block
+        begin
+          todo = @todo
+          block = @block
 
-        while true
-          work = todo.pop
+          tid = Thread.current.__id__
 
-          case work
-          when Stop
-            break
-          when Trim
-            @mutex.synchronize do
-              @trim_requested -= 1
+          while true
+            work = todo.pop
+
+            case work
+            when Stop
+              break
+            when Trim
+              @mutex.synchronize do
+                @trim_requested -= 1
+              end
+
+              break
+            else
+              block.call work
             end
-
-            break
-          else
-            block.call work
           end
-        end
-
-        @mutex.synchronize do
-          @spawned -= 1
-          @workers.delete th
+        rescue Exception => e
+          p e
+        ensure
+          @mutex.synchronize do
+            @spawned -= 1
+            @workers.delete th
+          end
         end
       end
 

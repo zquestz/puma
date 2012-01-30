@@ -5,6 +5,7 @@ require 'puma/thread_pool'
 require 'puma/const'
 require 'puma/events'
 require 'puma/null_io'
+require 'puma/accept'
 
 require 'puma/puma_http11'
 
@@ -38,14 +39,16 @@ module Puma
       @app = app
       @events = events
 
-      @check, @notify = IO.pipe
-      @ios = [@check]
+      @check = Queue.new
+      @sockets = []
 
       @status = :stop
 
       @min_threads = 0
       @max_threads = 16
       @auto_trim_time = 1
+
+      @acceptors = 2
 
       @thread = nil
       @thread_pool = nil
@@ -105,7 +108,7 @@ module Puma
         s.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
       end
       s.listen backlog
-      @ios << s
+      @sockets << s
     end
 
     def add_ssl_listener(host, port, ctx, optimize_for_latency=true, backlog=1024)
@@ -114,13 +117,13 @@ module Puma
         s.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
       end
       s.listen backlog
-      @ios << OpenSSL::SSL::SSLServer.new(s, ctx)
+      @sockets << OpenSSL::SSL::SSLServer.new(s, ctx)
     end
 
     # Tell the server to listen on +path+ as a UNIX domain socket.
     #
     def add_unix_listener(path)
-      @ios << UNIXServer.new(path)
+      @sockets << UNIXServer.new(path)
     end
 
     def backlog
@@ -129,6 +132,46 @@ module Puma
 
     def running
       @thread_pool and @thread_pool.spawned
+    end
+
+    class Acceptor
+      def initialize(events, sockets, pool, close)
+        @events = events
+        @sockets = sockets
+        @pool = pool
+        @close = close
+        @thread = nil
+      end
+
+      attr_reader :thread
+
+      def run
+        @thread = Thread.new do
+          sockets = @sockets + [@close]
+          pool = @pool
+          close = @close
+
+          run = true
+
+          begin
+            while run
+              ios = IO.select sockets
+              ios.first.each do |sock|
+                if sock == close
+                  run = false
+                  break
+                end
+
+                if client = Puma.try_accept(sock)
+                  pool << client
+                end
+              end
+            end
+          rescue Object => e
+            @events.unknown_error self, e, "Listen loop"
+          end
+        end
+      end
     end
 
     # Runs the server.  It returns the thread used so you can join it.
@@ -149,51 +192,33 @@ module Puma
 
       @thread = Thread.new do
         begin
-          check = @check
-          sockets = @ios
-          pool = @thread_pool
+          r, w = IO.pipe
 
-          while @status == :run
-            begin
-              ios = IO.select sockets
-              ios.first.each do |sock|
-                if sock == check
-                  break if handle_check
-                else
-                  pool << sock.accept
-                end
-              end
-            rescue Errno::ECONNABORTED
-              # client closed the socket even before accept
-              client.close rescue nil
-            rescue Object => e
-              @events.unknown_error self, e, "Listen loop"
-            end
+          accepts = []
+
+          @acceptors.times do
+            a = Acceptor.new(@events, @sockets, @thread_pool, r)
+            a.run
+            accepts << a
           end
 
-          graceful_shutdown if @status == :stop
+          while @status == :run
+            @status = @check.pop
+          end
+
+          if @status == :stop
+            w << "!"
+            accepts.each { |a| a.thread.join }
+            graceful_shutdown
+          end
         ensure
-          @ios.each { |i| i.close }
+          @sockets.each { |i| i.close }
+          r.close
+          w.close
         end
       end
 
       return @thread
-    end
-
-    # :nodoc:
-    def handle_check
-      cmd = @check.read(1) 
-
-      case cmd
-      when STOP_COMMAND
-        @status = :stop
-        return true
-      when HALT_COMMAND
-        @status = :halt
-        return true
-      end
-
-      return false
     end
 
     # Given a connection on +client+, handle the incoming requests.
@@ -559,14 +584,14 @@ module Puma
     #
     def stop(sync=false)
       @persistent_wakeup.close
-      @notify << STOP_COMMAND
+      @check << :stop
 
       @thread.join if @thread && sync
     end
 
     def halt(sync=false)
       @persistent_wakeup.close
-      @notify << HALT_COMMAND
+      @check << :halt
 
       @thread.join if @thread && sync
     end
