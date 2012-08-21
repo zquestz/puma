@@ -124,7 +124,11 @@ module Puma
     def try_to_finish
       return read_body unless @read_header
 
+      puts caller(0)
+
+      p :rp
       data = @io.readpartial(CHUNK_SIZE)
+      p data
 
       if @buffer
         @buffer << data
@@ -145,15 +149,21 @@ module Puma
     end
 
     if IS_JRUBY
-      def jruby_start_try_to_finish
+      undef_method :try_to_finish
+
+      def try_to_finish
+        p :jruby_start => @read_header
         return read_body unless @read_header
 
         begin
           data = @io.sysread_nonblock(CHUNK_SIZE)
         rescue OpenSSL::SSL::SSLError => e
+          p e => e.kind_of?(IO::WaitReadable)
           return false if e.kind_of? IO::WaitReadable
           raise e
         end
+
+        p :ttf => data
 
         if @buffer
           @buffer << data
@@ -177,10 +187,11 @@ module Puma
         return true if @ready
 
         if @io.kind_of? OpenSSL::SSL::SSLSocket
-          return true if jruby_start_try_to_finish
+          return true if try_to_finish
         end
 
         return false unless IO.select([@to_io], nil, nil, 0)
+        p :ttf
         try_to_finish
       end
 

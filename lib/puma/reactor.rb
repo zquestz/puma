@@ -41,6 +41,7 @@ module Puma
               end
 
               begin
+                p :io_ready => c
                 if c.try_to_finish
                   @app_pool << c
                   sockets.delete c

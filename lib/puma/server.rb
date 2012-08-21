@@ -211,6 +211,7 @@ module Puma
         rescue IOError
           client.close
         else
+          p :process_now => [process_now, client]
           if process_now
             process_client client
           else
