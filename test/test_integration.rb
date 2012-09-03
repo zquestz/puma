@@ -34,6 +34,11 @@ class TestIntegration < Test::Unit::TestCase
     cmd = "#{core} --restart-cmd '#{core}' -b tcp://127.0.0.1:#{@tcp_port} #{opts}"
     @server = IO.popen(cmd, "r")
 
+    loop do
+      break unless IO.select([@server], nil, nil, 5)
+      p @server.gets
+    end
+
     sleep 1
     @server
   end
@@ -80,7 +85,10 @@ class TestIntegration < Test::Unit::TestCase
     s.readpartial(20)
     signal :USR2
 
-    sleep 3
+    loop do
+      break unless IO.select([@server], nil, nil, 5)
+      p @server.gets
+    end
 
     s.write "GET / HTTP/1.1\r\n\r\n"
 
