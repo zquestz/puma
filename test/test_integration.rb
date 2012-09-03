@@ -82,7 +82,8 @@ class TestIntegration < Test::Unit::TestCase
     s << "GET / HTTP/1.1\r\n\r\n"
     true until s.gets == "\r\n"
 
-    s.readpartial(20)
+    p s.readpartial(20)
+    system "kill -USR1 #{@server.pid}"
     system "kill -USR2 #{@server.pid}"
 
     sleep 5

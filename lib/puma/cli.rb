@@ -434,12 +434,18 @@ module Puma
 
       begin
         Signal.trap "SIGUSR2" do
-          log "* Beginning hot restart..."
+          STDERR.puts "* Beginning hot restart..."
+          STDERR.flush
           @restart = true
           server.begin_restart
         end
       rescue Exception
         log "*** Sorry signal SIGUSR2 not implemented, restart feature disabled!"
+      end
+
+      Signal.trap "SIGUSR1" do
+        STDERR.puts "== GOT USR1 =="
+        STDERR.flush
       end
 
       begin
