@@ -83,7 +83,9 @@ class TestIntegration < Test::Unit::TestCase
     true until s.gets == "\r\n"
 
     s.readpartial(20)
-    signal :USR2
+    system "kill -USR2 #{@server.pid}"
+
+    sleep 5
 
     loop do
       break unless IO.select([@server], nil, nil, 5)
