@@ -434,6 +434,7 @@ module Puma
 
       begin
         Signal.trap "SIGUSR2" do
+          log "* Beginning hot restart..."
           @restart = true
           server.begin_restart
         end
