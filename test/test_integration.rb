@@ -83,6 +83,8 @@ class TestIntegration < Test::Unit::TestCase
     true until s.gets == "\r\n"
 
     p s.readpartial(20)
+    p @server.pid
+    system "ps ax"
     system "kill -USR1 #{@server.pid}"
     system "kill -USR2 #{@server.pid}"
 
