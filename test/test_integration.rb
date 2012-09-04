@@ -31,7 +31,7 @@ class TestIntegration < Test::Unit::TestCase
 
   def server(opts)
     core = "#{Gem.ruby} -rubygems -Ilib bin/puma"
-    cmd = "#{core} --restart-cmd '#{core}' -b tcp://127.0.0.1:#{@tcp_port} #{opts}"
+    cmd = "exec #{core} --restart-cmd '#{core}' -b tcp://127.0.0.1:#{@tcp_port} #{opts}"
     p cmd
     @server = IO.popen(cmd, "r")
 
