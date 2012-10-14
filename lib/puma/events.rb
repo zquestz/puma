@@ -29,6 +29,10 @@ module Puma
       @stdout.puts str
     end
 
+    def write(str)
+      @stdout.write str
+    end
+
     # Write +str+ to +@stderr+
     #
     def error(str)
@@ -65,6 +69,20 @@ module Puma
     #
     def self.strings
       Events.new StringIO.new, StringIO.new
+    end
+  end
+
+  class PidEvents < Events
+    def log(str)
+      super "[#{$$}] #{str}"
+    end
+
+    def write(str)
+      super "[#{$$}] #{str}"
+    end
+
+    def error(str)
+      super "[#{$$}] #{str}"
     end
   end
 end

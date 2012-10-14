@@ -1,6 +1,9 @@
 require 'rack'
 
 module Puma
+  class UnsupportedOption < RuntimeError
+  end
+
 
   # Every standard HTTP code mapped to the appropriate message.  These are
   # used so frequently that they are placed directly in Puma for easy
@@ -25,7 +28,9 @@ module Puma
   # too taxing on performance.
   module Const
 
-    PUMA_VERSION = VERSION = "1.6.2".freeze
+    PUMA_VERSION = VERSION = "2.0.0.b1".freeze
+
+    FAST_TRACK_KA_TIMEOUT = 0.2
 
     # The default number of seconds for another request within a persistent
     # session.
@@ -47,10 +52,16 @@ module Puma
 
     PUMA_TMP_BASE = "puma".freeze
 
+    # Indicate that we couldn't parse the request
+    ERROR_400_RESPONSE = "HTTP/1.1 400 Bad Request\r\n\r\n"
+
     # The standard empty 404 response for bad requests.  Use Error4040Handler for custom stuff.
     ERROR_404_RESPONSE = "HTTP/1.1 404 Not Found\r\nConnection: close\r\nServer: Puma #{PUMA_VERSION}\r\n\r\nNOT FOUND".freeze
 
     CONTENT_LENGTH = "CONTENT_LENGTH".freeze
+
+    # Indicate that there was an internal error, obviously.
+    ERROR_500_RESPONSE = "HTTP/1.1 500 Internal Server Error\r\n\r\n"
 
     # A common header for indicating the server is too busy.  Not used yet.
     ERROR_503_RESPONSE = "HTTP/1.1 503 Service Unavailable\r\n\r\nBUSY".freeze

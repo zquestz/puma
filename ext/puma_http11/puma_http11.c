@@ -456,6 +456,9 @@ VALUE HttpParser_body(VALUE self) {
   return http->body;
 }
 
+void Init_io_buffer(VALUE puma);
+void Init_mini_ssl(VALUE mod);
+
 void Init_puma_http11()
 {
 
@@ -482,4 +485,7 @@ void Init_puma_http11()
   rb_define_method(cHttpParser, "nread", HttpParser_nread, 0);
   rb_define_method(cHttpParser, "body", HttpParser_body, 0);
   init_common_fields();
+
+  Init_io_buffer(mPuma);
+  Init_mini_ssl(mPuma);
 }

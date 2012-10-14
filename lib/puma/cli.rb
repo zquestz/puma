@@ -4,7 +4,9 @@ require 'uri'
 require 'puma/server'
 require 'puma/const'
 require 'puma/configuration'
+require 'puma/binder'
 require 'puma/detect'
+require 'puma/daemon_ext'
 
 require 'rack/commonlogger'
 require 'rack/utils'
@@ -20,9 +22,12 @@ module Puma
     # this object will report status on.
     #
     def initialize(argv, stdout=STDOUT, stderr=STDERR)
+      @debug = false
       @argv = argv
       @stdout = stdout
       @stderr = stderr
+
+      @workers = []
 
       @events = Events.new @stdout, @stderr
 
@@ -31,26 +36,12 @@ module Puma
 
       @restart = false
 
-      @listeners = []
-
       setup_options
 
       generate_restart_data
 
-      @inherited_fds = {}
-      remove = []
-
-      ENV.each do |k,v|
-        if k =~ /PUMA_INHERIT_\d+/
-          fd, url = v.split(":", 2)
-          @inherited_fds[url] = fd.to_i
-          remove << k
-        end
-      end
-
-      remove.each do |k|
-        ENV.delete k
-      end
+      @binder = Binder.new(@events)
+      @binder.import_from_env
     end
 
     def restart_on_stop!
@@ -98,8 +89,8 @@ module Puma
         blk.call self
       end
 
-      if IS_JRUBY
-        @listeners.each_with_index do |(str,io),i|
+      if jruby?
+        @binder.listeners.each_with_index do |(str,io),i|
           io.close
 
           # We have to unlink a unix socket path that's not being used
@@ -113,7 +104,7 @@ module Puma
         require 'puma/jruby_restart'
         JRubyRestart.chdir_exec(@restart_dir, Gem.ruby, *@restart_argv)
       else
-        @listeners.each_with_index do |(l,io),i|
+        @binder.listeners.each_with_index do |(l,io),i|
           ENV["PUMA_INHERIT_#{i}"] = "#{io.to_i}:#{l}"
         end
 
@@ -140,6 +131,26 @@ module Puma
       @events.error str
     end
 
+    def debug(str)
+      if @options[:debug]
+        @events.log "- #{str}"
+      end
+    end
+
+    def jruby?
+      IS_JRUBY
+    end
+
+    def windows?
+      RUBY_PLATFORM =~ /mswin32|ming32/
+    end
+
+    def unsupported(str, cond=true)
+      return unless cond
+      @events.error str
+      raise UnsupportedOption
+    end
+
     # Build the OptionParser object to handle the available options.
     #
     def setup_options
@@ -147,16 +158,51 @@ module Puma
         :min_threads => 0,
         :max_threads => 16,
         :quiet => false,
-        :binds => []
+        :debug => false,
+        :binds => [],
+        :workers => 0,
+        :daemon => false
       }
 
       @parser = OptionParser.new do |o|
-        o.on "-b", "--bind URI", "URI to bind to (tcp:// and unix:// only)" do |arg|
+        o.on "-b", "--bind URI", "URI to bind to (tcp://, unix://, ssl://)" do |arg|
           @options[:binds] << arg
         end
 
         o.on "-C", "--config PATH", "Load PATH as a config file" do |arg|
           @options[:config_file] = arg
+        end
+
+        o.on "--control URL", "The bind url to use for the control server",
+                              "Use 'auto' to use temp unix server" do |arg|
+          if arg
+            @options[:control_url] = arg
+          elsif jruby?
+            unsupported "No default url available on JRuby"
+          end
+        end
+
+        o.on "--control-token TOKEN",
+             "The token to use as authentication for the control server" do |arg|
+          @options[:control_auth_token] = arg
+        end
+
+        o.on "-d", "--daemon", "Daemonize the server into the background" do
+          @options[:daemon] = true
+          @options[:quiet] = true
+        end
+
+        o.on "--debug", "Log lowlevel debugging information" do
+          @options[:debug] = true
+        end
+
+        o.on "--dir DIR", "Change to DIR before starting" do |d|
+          @options[:directory] = d.to_s
+        end
+
+        o.on "-e", "--environment ENVIRONMENT",
+             "The environment to run the Rack app on (default development)" do |arg|
+          @options[:environment] = arg
         end
 
         o.on "-I", "--include PATH", "Specify $LOAD_PATH directories" do |arg|
@@ -176,22 +222,14 @@ module Puma
           @options[:quiet] = true
         end
 
+        o.on "--restart-cmd CMD",
+             "The puma command to run during a hot restart",
+             "Default: inferred" do |cmd|
+          @options[:restart_cmd] = cmd
+        end
+
         o.on "-S", "--state PATH", "Where to store the state details" do |arg|
           @options[:state] = arg
-        end
-
-        o.on "--control URL", "The bind url to use for the control server",
-                              "Use 'auto' to use temp unix server" do |arg|
-          if arg
-            @options[:control_url] = arg
-          elsif IS_JRUBY
-            raise NotImplementedError, "No default url available on JRuby"
-          end
-        end
-
-        o.on "--control-token TOKEN",
-             "The token to use as authentication for the control server" do |arg|
-          @options[:control_auth_token] = arg
         end
 
         o.on '-t', '--threads INT', "min:max threads to use (default 0:16)" do |arg|
@@ -205,16 +243,14 @@ module Puma
           end
         end
 
-        o.on "--restart-cmd CMD",
-             "The puma command to run during a hot restart",
-             "Default: inferred" do |cmd|
-          @options[:restart_cmd] = cmd
+        o.on "-w", "--workers COUNT",
+                   "Activate cluster mode: How many worker processes to create" do |arg|
+          unsupported "-w not supported on JRuby and Windows",
+                      jruby? || windows?
+
+          @options[:workers] = arg.to_i
         end
 
-        o.on "-e", "--environment ENVIRONMENT",
-             "The environment to run the Rack app on (default development)" do |arg|
-          @options[:environment] = arg
-        end
       end
 
       @parser.banner = "puma <options> <rackup file>"
@@ -287,116 +323,67 @@ module Puma
       log " - Goodbye!"
     end
 
+    def redirect_io
+      stdout = @options[:redirect_stdout]
+      stderr = @options[:redirect_stderr]
+      append = @options[:redirect_append]
+
+      if stdout
+        STDOUT.reopen stdout, (append ? "a" : "w")
+      end
+
+      if stderr
+        STDOUT.reopen stderr, (append ? "a" : "w")
+      end
+    end
+
     # Parse the options, load the rackup, start the server and wait
     # for it to finish.
     #
     def run
-      parse_options
+      begin
+        parse_options
+      rescue UnsupportedOption
+        exit 1
+      end
+
+      if dir = @options[:directory]
+        Dir.chdir dir
+      end
+
+      clustered = @options[:workers] > 0
+
+      if clustered
+        @events = PidEvents.new STDOUT, STDERR
+        @options[:logger] = @events
+      end
 
       set_rack_environment
-
-      app = @config.app
 
       write_pid
       write_state
 
+      if clustered
+        run_cluster
+      else
+        run_single
+      end
+    end
+
+    def run_single
       min_t = @options[:min_threads]
       max_t = @options[:max_threads]
-
-      server = Puma::Server.new app, @events
-      server.min_threads = min_t
-      server.max_threads = max_t
 
       log "Puma #{Puma::Const::PUMA_VERSION} starting..."
       log "* Min threads: #{min_t}, max threads: #{max_t}"
       log "* Environment: #{ENV['RACK_ENV']}"
 
-      @options[:binds].each do |str|
-        uri = URI.parse str
-        case uri.scheme
-        when "tcp"
-          if fd = @inherited_fds.delete(str)
-            log "* Inherited #{str}"
-            io = server.inherit_tcp_listener uri.host, uri.port, fd
-          else
-            log "* Listening on #{str}"
-            io = server.add_tcp_listener uri.host, uri.port
-          end
+      @binder.parse @options[:binds], self
 
-          @listeners << [str, io]
-        when "unix"
-          path = "#{uri.host}#{uri.path}"
-
-          if fd = @inherited_fds.delete(str)
-            log "* Inherited #{str}"
-            io = server.inherit_unix_listener path, fd
-          else
-            log "* Listening on #{str}"
-
-            umask = nil
-
-            if uri.query
-              params = Rack::Utils.parse_query uri.query
-              if u = params['umask']
-                # Use Integer() to respect the 0 prefix as octal
-                umask = Integer(u)
-              end
-            end
-
-            io = server.add_unix_listener path, umask
-          end
-
-          @listeners << [str, io]
-        when "ssl"
-          params = Rack::Utils.parse_query uri.query
-          require 'openssl'
-
-          ctx = OpenSSL::SSL::SSLContext.new
-          unless params['key']
-            error "Please specify the SSL key via 'key='"
-          end
-
-          ctx.key = OpenSSL::PKey::RSA.new File.read(params['key'])
-
-          unless params['cert']
-            error "Please specify the SSL cert via 'cert='"
-          end
-
-          ctx.cert = OpenSSL::X509::Certificate.new File.read(params['cert'])
-
-          ctx.verify_mode = OpenSSL::SSL::VERIFY_NONE
-
-          if fd = @inherited_fds.delete(str)
-            log "* Inherited #{str}"
-            io = server.inherited_ssl_listener fd, ctx
-          else
-            log "* Listening on #{str}"
-            io = server.add_ssl_listener uri.host, uri.port, ctx
-          end
-
-          @listeners << [str, io]
-        else
-          error "Invalid URI: #{str}"
-        end
-      end
-
-      # If we inherited fds but didn't use them (because of a
-      # configuration change), then be sure to close them.
-      @inherited_fds.each do |str, fd|
-        log "* Closing unused inherited connection: #{str}"
-
-        begin
-          IO.for_fd(fd).close
-        rescue SystemCallError
-        end
-
-        # We have to unlink a unix socket path that's not being used
-        uri = URI.parse str
-        if uri.scheme == "unix"
-          path = "#{uri.host}#{uri.path}"
-          File.unlink path
-        end
-      end
+      server = Puma::Server.new @config.app, @events
+      server.binder = @binder
+      server.min_threads = min_t
+      server.max_threads = max_t
 
       @server = server
 
@@ -457,7 +444,13 @@ module Puma
         log "*** Sorry signal SIGTERM not implemented, gracefully stopping feature disabled!"
       end
 
-      log "Use Ctrl-C to stop"
+      if @options[:daemon]
+        Process.daemon(true)
+      else
+        log "Use Ctrl-C to stop"
+      end
+
+      redirect_io
 
       begin
         server.run.join
@@ -468,6 +461,155 @@ module Puma
       if @restart
         log "* Restarting..."
         @status.stop true if @status
+        restart!
+      end
+    end
+
+    def worker
+      $0 = "puma: cluster worker: #{@master_pid}"
+      Signal.trap "SIGINT", "IGNORE"
+
+      @suicide_pipe.close
+
+      Thread.new do
+        IO.select [@check_pipe]
+        log "! Detected parent died, dieing"
+        exit! 1
+      end
+
+      min_t = @options[:min_threads]
+      max_t = @options[:max_threads]
+
+      server = Puma::Server.new @config.app, @events
+      server.min_threads = min_t
+      server.max_threads = max_t
+      server.binder = @binder
+
+      Signal.trap "SIGTERM" do
+        server.stop
+      end
+
+      server.run.join
+    end
+
+    def stop_workers
+      log "- Gracefully shutting down workers..."
+      @workers.each { |x| x.term }
+
+      begin
+        Process.waitall
+      rescue Interrupt
+        log "! Cancelled waiting for workers"
+      else
+        log "- Goodbye!"
+      end
+    end
+
+    class Worker
+      def initialize(pid)
+        @pid = pid
+      end
+
+      attr_reader :pid
+
+      def term
+        begin
+          Process.kill "TERM", @pid
+        rescue Errno::ESRCH
+        end
+      end
+    end
+
+    def spawn_workers
+      diff = @options[:workers] - @workers.size
+
+      diff.times do
+        pid = fork { worker }
+        debug "Spawned worker: #{pid}"
+        @workers << Worker.new(pid)
+      end
+    end
+
+    def check_workers
+      while true
+        pid = Process.waitpid(-1, Process::WNOHANG)
+        break unless pid
+
+        @workers.delete_if { |w| w.pid == pid }
+      end
+
+      spawn_workers
+    end
+
+    def run_cluster
+      log "Puma #{Puma::Const::PUMA_VERSION} starting in cluster mode..."
+      log "* Process workers: #{@options[:workers]}"
+      log "* Min threads: #{@options[:min_threads]}, max threads: #{@options[:max_threads]}"
+      log "* Environment: #{ENV['RACK_ENV']}"
+
+      @binder.parse @options[:binds], self
+
+      @master_pid = Process.pid
+
+      read, write = IO.pipe
+
+      Signal.trap "SIGCHLD" do
+        write.write "!"
+      end
+
+      stop = false
+
+      begin
+        Signal.trap "SIGUSR2" do
+          @restart = true
+          stop = true
+          write.write "!"
+        end
+      rescue Exception
+      end
+
+      begin
+        Signal.trap "SIGTERM" do
+          stop = true
+          write.write "!"
+        end
+      rescue Exception
+      end
+
+      # Used by the workers to detect if the master process dies.
+      # If select says that @check_pipe is ready, it's because the
+      # master has exited and @suicide_pipe has been automatically
+      # closed.
+      #
+      @check_pipe, @suicide_pipe = IO.pipe
+
+      if @options[:daemon]
+        Process.daemon(true)
+      else
+        log "Use Ctrl-C to stop"
+      end
+
+      redirect_io
+
+      spawn_workers
+
+      begin
+        while !stop
+          begin
+            IO.select([read], nil, nil, 5)
+            check_workers
+          rescue Interrupt
+            stop = true
+          end
+        end
+
+        stop_workers
+      ensure
+        delete_pidfile
+      end
+
+      if @restart
+        log "* Restarting..."
         restart!
       end
     end

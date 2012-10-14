@@ -48,7 +48,7 @@ module Puma
       @timeout_at = Time.now + val
     end
 
-    def reset
+    def reset(fast_check=true)
       @parser.reset
       @read_header = true
       @env = @proto_env.dup
@@ -67,6 +67,9 @@ module Puma
         end
 
         return false
+      elsif fast_check &&
+            IO.select([@to_io], nil, nil, FAST_TRACK_KA_TIMEOUT)
+        return try_to_finish
       end
     end
 
@@ -124,7 +127,11 @@ module Puma
     def try_to_finish
       return read_body unless @read_header
 
-      data = @io.readpartial(CHUNK_SIZE)
+      begin
+        data = @io.read_nonblock(CHUNK_SIZE)
+      rescue Errno::EAGAIN
+        return false
+      end
 
       if @buffer
         @buffer << data
@@ -204,7 +211,11 @@ module Puma
         want = remain
       end
 
-      chunk = @io.readpartial(want)
+      begin
+        chunk = @io.read_nonblock(want)
+      rescue Errno::EAGAIN
+        return false
+      end
 
       # No chunk means a closed socket
       unless chunk
@@ -228,6 +239,20 @@ module Puma
       @body_remain = remain
 
       false
+    end
+
+    def write_400
+      begin
+        @io << ERROR_400_RESPONSE
+      rescue StandardError
+      end
+    end
+
+    def write_500
+      begin
+        @io << ERROR_500_RESPONSE
+      rescue StandardError
+      end
     end
   end
 end

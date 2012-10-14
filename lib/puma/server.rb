@@ -8,8 +8,15 @@ require 'puma/null_io'
 require 'puma/compat'
 require 'puma/reactor'
 require 'puma/client'
+require 'puma/binder'
+require 'puma/delegation'
+require 'puma/accept_nonblock'
 
 require 'puma/puma_http11'
+
+unless Puma.const_defined? "IOBuffer"
+  require 'puma/io_buffer'
+end
 
 require 'socket'
 
@@ -19,6 +26,7 @@ module Puma
   class Server
 
     include Puma::Const
+    extend  Puma::Delegation
 
     attr_reader :thread
     attr_reader :events
@@ -42,7 +50,6 @@ module Puma
       @events = events
 
       @check, @notify = IO.pipe
-      @ios = [@check]
 
       @status = :stop
 
@@ -56,33 +63,17 @@ module Puma
       @persistent_timeout = PERSISTENT_TIMEOUT
       @persistent_check, @persistent_wakeup = IO.pipe
 
+      @binder = Binder.new(events)
       @first_data_timeout = FIRST_DATA_TIMEOUT
-
-      @unix_paths = []
-
-      @proto_env = {
-        "rack.version".freeze => Rack::VERSION,
-        "rack.errors".freeze => events.stderr,
-        "rack.multithread".freeze => true,
-        "rack.multiprocess".freeze => false,
-        "rack.run_once".freeze => false,
-        "SCRIPT_NAME".freeze => ENV['SCRIPT_NAME'] || "",
-
-        # Rack blows up if this is an empty string, and Rack::Lint
-        # blows up if it's nil. So 'text/plain' seems like the most
-        # sensible default value.
-        "CONTENT_TYPE".freeze => "text/plain",
-
-        "QUERY_STRING".freeze => "",
-        SERVER_PROTOCOL => HTTP_11,
-        SERVER_SOFTWARE => PUMA_VERSION,
-        GATEWAY_INTERFACE => CGI_VER
-      }
-
-      @envs = {}
 
       ENV['RACK_ENV'] ||= "development"
     end
+
+    attr_accessor :binder
+
+    forward :add_tcp_listener,  :@binder
+    forward :add_ssl_listener,  :@binder
+    forward :add_unix_listener, :@binder
 
     # On Linux, use TCP_CORK to better control how the TCP stack
     # packetizes our stream. This improves both latency and throughput.
@@ -106,81 +97,6 @@ module Puma
       end
     end
 
-    # Tell the server to listen on host +host+, port +port+.
-    # If +optimize_for_latency+ is true (the default) then clients connecting
-    # will be optimized for latency over throughput.
-    #
-    # +backlog+ indicates how many unaccepted connections the kernel should
-    # allow to accumulate before returning connection refused.
-    #
-    def add_tcp_listener(host, port, optimize_for_latency=true, backlog=1024)
-      s = TCPServer.new(host, port)
-      if optimize_for_latency
-        s.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
-      end
-      s.setsockopt(Socket::SOL_SOCKET,Socket::SO_REUSEADDR, true)
-      s.listen backlog
-      @ios << s
-      s
-    end
-
-    def inherit_tcp_listener(host, port, fd)
-      s = TCPServer.for_fd(fd)
-      @ios << s
-      s
-    end
-
-    def add_ssl_listener(host, port, ctx, optimize_for_latency=true, backlog=1024)
-      s = TCPServer.new(host, port)
-      if optimize_for_latency
-        s.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
-      end
-      s.setsockopt(Socket::SOL_SOCKET,Socket::SO_REUSEADDR, true)
-      s.listen backlog
-
-      ssl = OpenSSL::SSL::SSLServer.new(s, ctx)
-      env = @proto_env.dup
-      env[HTTPS_KEY] = HTTPS
-      @envs[ssl] = env
-
-      @ios << ssl
-      s
-    end
-
-    def inherited_ssl_listener(fd, ctx)
-      s = TCPServer.for_fd(fd)
-      @ios << OpenSSL::SSL::SSLServer.new(s, ctx)
-      s
-    end
-
-    # Tell the server to listen on +path+ as a UNIX domain socket.
-    #
-    def add_unix_listener(path, umask=nil)
-      @unix_paths << path
-
-      # Let anyone connect by default
-      umask ||= 0
-
-      begin
-        old_mask = File.umask(umask)
-        s = UNIXServer.new(path)
-        @ios << s
-      ensure
-        File.umask old_mask
-      end
-
-      s
-    end
-
-    def inherit_unix_listener(path, fd)
-      @unix_paths << path
-
-      s = UNIXServer.for_fd fd
-      @ios << s
-
-      s
-    end
-
     def backlog
       @thread_pool and @thread_pool.backlog
     end
@@ -200,19 +116,23 @@ module Puma
 
       @status = :run
 
-      @thread_pool = ThreadPool.new(@min_threads, @max_threads) do |client|
+      @thread_pool = ThreadPool.new(@min_threads,
+                                    @max_threads,
+                                    IOBuffer) do |client, buffer|
         process_now = false
 
         begin
           process_now = client.eagerly_finish
         rescue HttpParserError => e
+          client.write_400
           client.close
+
           @events.parse_error self, client.env, e
         rescue IOError
           client.close
         else
           if process_now
-            process_client client
+            process_client client, buffer
           else
             client.set_timeout @first_data_timeout
             @reactor.add client
@@ -239,7 +159,7 @@ module Puma
     def handle_servers
       begin
         check = @check
-        sockets = @ios
+        sockets = [check] + @binder.ios
         pool = @thread_pool
 
         while @status == :run
@@ -249,8 +169,13 @@ module Puma
               if sock == check
                 break if handle_check
               else
-                c = Client.new sock.accept, @envs.fetch(sock, @proto_env)
-                pool << c
+                begin
+                  if io = sock.accept_nonblock
+                    c = Client.new io, @binder.env(sock)
+                    pool << c
+                  end
+                rescue SystemCallError
+                end
               end
             end
           rescue Errno::ECONNABORTED
@@ -261,14 +186,14 @@ module Puma
           end
         end
 
+        graceful_shutdown if @status == :stop || @status == :restart
         @reactor.clear! if @status == :restart
 
         @reactor.shutdown
-        graceful_shutdown if @status == :stop
       ensure
         unless @status == :restart
-          @ios.each { |i| i.close }
-          @unix_paths.each { |i| File.unlink i }
+          @check.close
+          @binder.close
         end
       end
     end
@@ -298,19 +223,21 @@ module Puma
     # indicates that it supports keep alive, wait for another request before
     # returning.
     #
-    def process_client(client)
+    def process_client(client, buffer)
       begin
         close_socket = true
 
         while true
-          case handle_request(client)
+          case handle_request(client, buffer)
           when false
             return
           when :async
             close_socket = false
             return
           when true
-            unless client.reset
+            buffer.reset
+
+            unless client.reset(@status == :run)
               close_socket = false
               client.set_timeout @persistent_timeout
               @reactor.add client
@@ -325,10 +252,14 @@ module Puma
 
       # The client doesn't know HTTP well
       rescue HttpParserError => e
+        client.write_400
+
         @events.parse_error self, client.env, e
 
       # Server error
       rescue StandardError => e
+        client.write_500
+
         @events.unknown_error self, e, "Read"
 
       ensure
@@ -389,7 +320,7 @@ module Puma
     # was one. This is an optimization to keep from having to look
     # it up again.
     #
-    def handle_request(req)
+    def handle_request(req, lines)
       env = req.env
       client = req.io
 
@@ -434,6 +365,9 @@ module Puma
 
         cork_socket client
 
+        line_ending = LINE_END
+        colon = COLON
+
         if env[HTTP_VERSION] == HTTP_11
           allow_chunked = true
           keep_alive = env[HTTP_CONNECTION] != CLOSE
@@ -444,13 +378,10 @@ module Puma
           # the response header.
           #
           if status == 200
-            client.write HTTP_11_200
+            lines << HTTP_11_200
           else
-            client.write "HTTP/1.1 "
-            client.write status.to_s
-            client.write " "
-            client.write HTTP_STATUS_CODES[status]
-            client.write "\r\n"
+            lines.append "HTTP/1.1 ", status.to_s, " ",
+                         HTTP_STATUS_CODES[status], line_ending
 
             no_body = status < 200 || STATUS_WITH_NO_ENTITY_BODY[status]
           end
@@ -462,20 +393,14 @@ module Puma
           # Same optimization as above for HTTP/1.1
           #
           if status == 200
-            client.write HTTP_10_200
+            lines << HTTP_10_200
           else
-            client.write "HTTP/1.0 "
-            client.write status.to_s
-            client.write " "
-            client.write HTTP_STATUS_CODES[status]
-            client.write "\r\n"
+            lines.append "HTTP/1.0 ", status.to_s, " ",
+                         HTTP_STATUS_CODES[status], line_ending
 
             no_body = status < 200 || STATUS_WITH_NO_ENTITY_BODY[status]
           end
         end
-
-        colon = COLON
-        line_ending = LINE_END
 
         headers.each do |k, vs|
           case k
@@ -490,51 +415,49 @@ module Puma
           end
 
           vs.split(NEWLINE).each do |v|
-            client.write k
-            client.write colon
-            client.write v
-            client.write line_ending
+            lines.append k, colon, v, line_ending
           end
         end
 
         if no_body
-          client.write line_ending
+          lines << line_ending
+          client.syswrite lines.to_s
           return keep_alive
         end
 
         if include_keepalive_header
-          client.write CONNECTION_KEEP_ALIVE
+          lines << CONNECTION_KEEP_ALIVE
         elsif !keep_alive
-          client.write CONNECTION_CLOSE
+          lines << CONNECTION_CLOSE
         end
 
         if content_length
-          client.write CONTENT_LENGTH_S
-          client.write content_length.to_s
-          client.write line_ending
+          lines.append CONTENT_LENGTH_S, content_length.to_s, line_ending
           chunked = false
         elsif allow_chunked
-          client.write TRANSFER_ENCODING_CHUNKED
+          lines << TRANSFER_ENCODING_CHUNKED
           chunked = true
         end
 
-        client.write line_ending
+        lines << line_ending
+
+        client.syswrite lines.to_s
 
         res_body.each do |part|
           if chunked
-            client.write part.bytesize.to_s(16)
-            client.write line_ending
-            client.write part
-            client.write line_ending
+            client.syswrite part.bytesize.to_s(16)
+            client.syswrite line_ending
+            client.syswrite part
+            client.syswrite line_ending
           else
-            client.write part
+            client.syswrite part
           end
 
           client.flush
         end
 
         if chunked
-          client.write CLOSE_CHUNKED
+          client.syswrite CLOSE_CHUNKED
           client.flush
         end
 

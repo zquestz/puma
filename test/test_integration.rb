@@ -3,6 +3,7 @@ require 'test/unit'
 require 'socket'
 require 'timeout'
 require 'net/http'
+require 'tempfile'
 
 require 'puma/cli'
 require 'puma/control_cli'
@@ -15,6 +16,7 @@ class TestIntegration < Test::Unit::TestCase
     @tcp_port = 9998
 
     @server = nil
+    @script = nil
   end
 
   def teardown
@@ -27,20 +29,27 @@ class TestIntegration < Test::Unit::TestCase
       Process.wait @server.pid
       @server.close
     end
+
+    if @script
+      @script.close!
+    end
   end
 
   def server(opts)
     core = "#{Gem.ruby} -rubygems -Ilib bin/puma"
-    cmd = "exec #{core} --restart-cmd '#{core}' -b tcp://127.0.0.1:#{@tcp_port} #{opts}"
-    p cmd
-    @server = IO.popen(cmd, "r")
+    cmd = "#{core} --restart-cmd '#{core}' -b tcp://127.0.0.1:#{@tcp_port} #{opts}"
+    tf = Tempfile.new "puma-test"
+    tf.puts "exec #{cmd}"
+    tf.close
 
-    loop do
-      break unless IO.select([@server], nil, nil, 5)
-      p @server.gets
-    end
+    @script = tf
+
+    @server = IO.popen("sh #{tf.path}", "r")
+
+    true while @server.gets =~ /Ctrl-C/
 
     sleep 1
+
     @server
   end
 
@@ -83,18 +92,38 @@ class TestIntegration < Test::Unit::TestCase
     s << "GET / HTTP/1.1\r\n\r\n"
     true until s.gets == "\r\n"
 
-    p s.readpartial(20)
-    p @server.pid
-    system "ps ax"
-    system "kill -USR1 #{@server.pid}"
-    system "kill -USR2 #{@server.pid}"
+    s.readpartial(20)
+    signal :USR2
 
-    sleep 5
+    true while @server.gets =~ /Ctrl-C/
+    sleep 1
 
-    loop do
-      break unless IO.select([@server], nil, nil, 5)
-      p @server.gets
+    s.write "GET / HTTP/1.1\r\n\r\n"
+
+    assert_raises Errno::ECONNRESET do
+      Timeout.timeout(2) do
+        r = s.read(2)
+        p :read_ret => r
+      end
     end
+
+    s = TCPSocket.new "localhost", @tcp_port
+    s << "GET / HTTP/1.0\r\n\r\n"
+    assert_equal "Hello World", s.read.split("\r\n").last
+  end
+
+  def test_restart_closes_keepalive_sockets_workers
+    server("-q -w 2 test/hello.ru")
+
+    s = TCPSocket.new "localhost", @tcp_port
+    s << "GET / HTTP/1.1\r\n\r\n"
+    true until s.gets == "\r\n"
+
+    s.readpartial(20)
+    signal :USR2
+
+    true while @server.gets =~ /Ctrl-C/
+    sleep 1
 
     s.write "GET / HTTP/1.1\r\n\r\n"
 
@@ -109,5 +138,14 @@ class TestIntegration < Test::Unit::TestCase
     s = TCPSocket.new "localhost", @tcp_port
     s << "GET / HTTP/1.0\r\n\r\n"
     assert_equal "Hello World", s.read.split("\r\n").last
+  end
+
+  def test_bad_query_string_outputs_400
+    server "-q test/hello.ru 2>&1"
+
+    s = TCPSocket.new "localhost", @tcp_port
+    s << "GET /?h=% HTTP/1.0\r\n\r\n"
+    data = s.read
+    assert_equal "HTTP/1.1 400 Bad Request\r\n\r\n", data
   end
 end

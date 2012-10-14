@@ -68,7 +68,8 @@ module Puma
       end
 
       unless @options[:quiet]
-        app = Rack::CommonLogger.new(app, STDOUT)
+        logger = @options[:logger] || STDOUT
+        app = Rack::CommonLogger.new(app, logger)
       end
 
       return app
@@ -155,6 +156,17 @@ module Puma
         @options[:binds] << url
       end
 
+      # Daemonize the server into the background. Highly suggest that
+      # this be combined with +pidfile+ and +stdout_redirect+.
+      def daemonize(which=true)
+        @options[:daemon] = which
+      end
+
+      # Set the environment in which the Rack's app will run.
+      def environment(environment)
+        @options[:environment] = environment
+      end
+
       # Code to run before doing a restart. This code should
       # close logfiles, database connections, etc.
       #
@@ -179,6 +191,13 @@ module Puma
       #
       def rackup(path)
         @options[:rackup] = path.to_s
+      end
+
+      # Redirect STDOUT and STDERR to files specified.
+      def stdout_redirect(stdout=nil, stderr=nil, append=false)
+        @options[:redirect_stdout] = stdout
+        @options[:redirect_stderr] = stderr
+        @options[:redirect_append] = append
       end
 
       # Configure +min+ to be the minimum number of threads to use to answer
@@ -209,9 +228,15 @@ module Puma
         @options[:state] = path.to_s
       end
 
-      # Set the environment in which the Rack's app will run.
-      def environment(environment)
-        @options[:environment] = environment
+      # *Cluster mode only* How many worker processes to run.
+      #
+      def workers(count)
+        @options[:workers] = count.to_i
+      end
+
+      # The directory to operate out of.
+      def directory(dir)
+        @options[:directory] = dir.to_s
       end
     end
   end
