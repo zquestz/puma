@@ -82,6 +82,10 @@ module Puma
       binds.each do |str|
         uri = URI.parse str
         case uri.scheme
+        when "harq"
+          logger.log "* Connecting to #{str}"
+          io = add_harq_connection uri.host, uri.port, uri.path
+          @listeners << [str, io]
         when "tcp"
           if fd = @inherited_fds.delete(str)
             logger.log "* Inherited #{str}"
@@ -175,7 +179,14 @@ module Puma
           File.unlink path
         end
       end
+    end
 
+    def add_harq_connection(host, port, path)
+      require 'puma/harq'
+
+      io = Puma::HarqConnection.new host, port, path
+
+      @ios << io
     end
 
     # Tell the server to listen on host +host+, port +port+.

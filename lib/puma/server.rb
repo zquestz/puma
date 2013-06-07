@@ -177,7 +177,9 @@ module Puma
                 break if handle_check
               else
                 begin
-                  if io = sock.accept_nonblock
+                  if sock.respond_to? :read_client
+                    pool << sock.read_client(@binder.env(sock))
+                  elsif io = sock.accept_nonblock
                     c = Client.new io, @binder.env(sock)
                     pool << c
                   end
@@ -306,8 +308,13 @@ module Puma
 
       unless env[REQUEST_PATH]
         # it might be a dumbass full host request header
-        uri = URI.parse(env[REQUEST_URI])
-        env[REQUEST_PATH] = uri.path
+        begin
+          uri = URI.parse(env[REQUEST_URI])
+        rescue StandardError => e
+          # nothing
+        else
+          env[REQUEST_PATH] = uri.path
+        end
 
         raise "No REQUEST PATH" unless env[REQUEST_PATH]
       end
@@ -378,6 +385,10 @@ module Puma
           @events.unknown_error self, e, "Rack app"
 
           status, headers, res_body = lowlevel_error(e)
+        end
+
+        if req.respond_to? :send_response
+          return req.send_response status, headers, res_body
         end
 
         content_length = nil
