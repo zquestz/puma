@@ -132,7 +132,6 @@ module Puma
                            :headers => headers,
                            :body => body
 
-        p rep
         @connection.queue rep
 
         false
