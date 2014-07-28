@@ -12,6 +12,7 @@ require 'puma/binder'
 require 'puma/delegation'
 require 'puma/accept_nonblock'
 require 'puma/util'
+require 'puma/rack_io'
 
 require 'puma/rack_patch'
 
@@ -93,34 +94,6 @@ module Puma
 
     def tcp_mode!
       @mode = :tcp
-    end
-
-    # On Linux, use TCP_CORK to better control how the TCP stack
-    # packetizes our stream. This improves both latency and throughput.
-    #
-    if RUBY_PLATFORM =~ /linux/
-      # 6 == Socket::IPPROTO_TCP
-      # 3 == TCP_CORK
-      # 1/0 == turn on/off
-      def cork_socket(socket)
-        begin
-          socket.setsockopt(6, 3, 1) if socket.kind_of? TCPSocket
-        rescue IOError, SystemCallError
-        end
-      end
-
-      def uncork_socket(socket)
-        begin
-          socket.setsockopt(6, 3, 0) if socket.kind_of? TCPSocket
-        rescue IOError, SystemCallError
-        end
-      end
-    else
-      def cork_socket(socket)
-      end
-
-      def uncork_socket(socket)
-      end
     end
 
     def backlog
@@ -456,11 +429,13 @@ module Puma
     # Given the request +env+ from +client+ and a partial request body
     # in +body+, finish reading the body if there is one and invoke
     # the rack app. Then construct the response and write it back to
-    # +client+
+    # +client+.
     #
-    # +cl+ is the previously fetched Content-Length header if there
-    # was one. This is an optimization to keep from having to look
-    # it up again.
+    # The return value controls how the server manages the socket. If
+    # it is true, then the socket is in keep-alive mode and we look
+    # for another request. If the value is false, we close the socket.
+    # And if the value is :async, we ignore the socket all together because
+    # the app has taken ownership of it.
     #
     def handle_request(req, lines)
       env = req.env
@@ -468,187 +443,16 @@ module Puma
 
       normalize_env env, client
 
-      env[PUMA_SOCKET] = client
-
-      env[HIJACK_P] = true
-      env[HIJACK] = req
-
-      body = req.body
-
-      head = env[REQUEST_METHOD] == HEAD
-
-      env[RACK_INPUT] = body
-      env[RACK_URL_SCHEME] =  env[HTTPS_KEY] ? HTTPS : HTTP
-
-      # A rack extension. If the app writes #call'ables to this
-      # array, we will invoke them when the request is done.
-      #
-      after_reply = env[RACK_AFTER_REPLY] = []
+      io = RackIO.new(env, client, lines)
 
       begin
-        begin
-          status, headers, res_body = @app.call(env)
-
-          return :async if req.hijacked
-
-          status = status.to_i
-
-          if status == -1
-            unless headers.empty? and res_body == []
-              raise "async response must have empty headers and body"
-            end
-
-            return :async
-          end
-        rescue StandardError => e
-          @events.unknown_error self, e, "Rack app"
-
-          status, headers, res_body = lowlevel_error(e)
-        end
-
-        content_length = nil
-        no_body = head
-
-        if res_body.kind_of? Array and res_body.size == 1
-          content_length = res_body[0].bytesize
-        end
-
-        cork_socket client
-
-        line_ending = LINE_END
-        colon = COLON
-
-        if env[HTTP_VERSION] == HTTP_11
-          allow_chunked = true
-          keep_alive = env[HTTP_CONNECTION] != CLOSE
-          include_keepalive_header = false
-
-          # An optimization. The most common response is 200, so we can
-          # reply with the proper 200 status without having to compute
-          # the response header.
-          #
-          if status == 200
-            lines << HTTP_11_200
-          else
-            lines.append "HTTP/1.1 ", status.to_s, " ",
-                         fetch_status_code(status), line_ending
-
-            no_body ||= status < 200 || STATUS_WITH_NO_ENTITY_BODY[status]
-          end
-        else
-          allow_chunked = false
-          keep_alive = env[HTTP_CONNECTION] == KEEP_ALIVE
-          include_keepalive_header = keep_alive
-
-          # Same optimization as above for HTTP/1.1
-          #
-          if status == 200
-            lines << HTTP_10_200
-          else
-            lines.append "HTTP/1.0 ", status.to_s, " ",
-                         fetch_status_code(status), line_ending
-
-            no_body ||= status < 200 || STATUS_WITH_NO_ENTITY_BODY[status]
-          end
-        end
-
-        response_hijack = nil
-
-        headers.each do |k, vs|
-          case k
-          when CONTENT_LENGTH2
-            content_length = vs
-            next
-          when TRANSFER_ENCODING
-            allow_chunked = false
-            content_length = nil
-          when HIJACK
-            response_hijack = vs
-            next
-          end
-
-          if vs.respond_to?(:to_s)
-            vs.to_s.split(NEWLINE).each do |v|
-              lines.append k, colon, v, line_ending
-            end
-          else
-            lines.append k, colon, line_ending
-          end
-        end
-
-        if no_body
-          if content_length and status != 204
-            lines.append CONTENT_LENGTH_S, content_length.to_s, line_ending
-          end
-
-          lines << line_ending
-          fast_write client, lines.to_s
-          return keep_alive
-        end
-
-        if include_keepalive_header
-          lines << CONNECTION_KEEP_ALIVE
-        elsif !keep_alive
-          lines << CONNECTION_CLOSE
-        end
-
-        unless response_hijack
-          if content_length
-            lines.append CONTENT_LENGTH_S, content_length.to_s, line_ending
-            chunked = false
-          elsif allow_chunked
-            lines << TRANSFER_ENCODING_CHUNKED
-            chunked = true
-          end
-        end
-
-        lines << line_ending
-
-        fast_write client, lines.to_s
-
-        if response_hijack
-          response_hijack.call client
-          return :async
-        end
-
-        begin
-          res_body.each do |part|
-            if chunked
-              fast_write client, part.bytesize.to_s(16)
-              fast_write client, line_ending
-              fast_write client, part
-              fast_write client, line_ending
-            else
-              fast_write client, part
-            end
-
-            client.flush
-          end
-
-          if chunked
-            fast_write client, CLOSE_CHUNKED
-            client.flush
-          end
-        rescue SystemCallError, IOError
-          raise ConnectionError, "Connection error detected during write"
-        end
-
+        @app.handle(env, req.body, io)
       ensure
-        uncork_socket client
-
-        body.close
-        res_body.close if res_body.respond_to? :close
-
-        after_reply.each { |o| o.call }
+        io.finalize
       end
 
-      return keep_alive
+      io.state
     end
-
-    def fetch_status_code(status)
-      HTTP_STATUS_CODES.fetch(status) { 'CUSTOM' }
-    end
-    private :fetch_status_code
 
     # Given the requset +env+ from +client+ and the partial body +body+
     # plus a potential Content-Length value +cl+, finish reading

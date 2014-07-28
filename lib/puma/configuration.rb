@@ -1,3 +1,5 @@
+require 'puma/rack1_adapter'
+
 module Puma
 
   # The CLI exports it's Configuration object here to allow
@@ -115,7 +117,7 @@ module Puma
         app = Rack::CommonLogger.new(app, logger)
       end
 
-      return ConfigMiddleware.new(self, app)
+      return Rack1Adapter.new(ConfigMiddleware.new(self, app), @options, @events)
     end
 
     def setup_random_token
