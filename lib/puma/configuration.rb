@@ -83,6 +83,66 @@ module Puma
       end
     end
 
+    class DeadmanSwitch
+      def initialize
+        @mutex = Mutex.new
+        @watches = Hash.new
+        @thread = nil
+      end
+
+      def start
+        @thread ||= Thread.new do
+          while true
+            now = Time.now
+
+            @mutex.synchronize do
+              @watches.each do |id, fin|
+                abort! if now > fin
+              end
+            end
+
+            sleep 5
+          end
+        end
+      end
+
+      def watch(env, timeout)
+        begin
+          @mutex.synchronize do
+            @watches[env.__id__] = Time.now + timeout
+          end
+
+          yield
+        ensure
+          @mutex.synchronize do
+            @watches.delete(env.__id__)
+          end
+        end
+      end
+
+      def abort!
+        $stdout.puts "Deadman switch failed. Goodbye."
+        exit! 9
+      end
+    end
+
+    # Injects a middleware that acts as a deadman switch for
+    # the request finishing.
+    class DeadmanSwitchMiddleware
+      Deadman = DeadmanSwitch.new
+
+      def initialize(timeout, app)
+        @timeout = timeout
+        @app = app
+      end
+
+      def call(env)
+        Deadman.watch(env, @timeout) do
+          @app.call(env)
+        end
+      end
+    end
+
     # Indicate if there is a properly configured app
     #
     def app_configured?
@@ -130,7 +190,14 @@ module Puma
         app = Rack::CommonLogger.new(app, logger)
       end
 
-      return ConfigMiddleware.new(self, app)
+      cfg = ConfigMiddleware.new(self, app)
+
+      if time = @options[:deadman_time]
+        DeadmanSwitchMiddleware::Deadman.start
+        return DeadmanSwitchMiddleware.new(time, cfg)
+      end
+
+      return cfg
     end
 
     def setup_random_token
@@ -231,6 +298,25 @@ module Puma
       # this be combined with +pidfile+ and +stdout_redirect+.
       def daemonize(which=true)
         @options[:daemon] = which
+      end
+
+      # *EXPERT ONLY* Define a max number of seconds a request must
+      # finish in. If the request does not, the entire process (all
+      # threads, all requests) is aborted and exits.
+      #
+      # This seems like a silly option. Why would you let one
+      # request failure to govern the survival of the entire process?
+      # Well, Thread.raise is quite error prone and some users
+      # wanted a mechanism that allowed them to have very, very
+      # tight constraints on request times. The only way to do that
+      # is with this option.
+      #
+      # I highly suggest you run this with threads = 1 or 2 because
+      # then it lowers the exposure of one request failing and bringing
+      # down other requests with it.
+      #
+      def enable_request_deadman_switch(time)
+        @options[:deadman_time] = Integer(time)
       end
 
       # When shutting down, drain the accept socket of pending
