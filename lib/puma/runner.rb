@@ -116,6 +116,8 @@ module Puma
         raise e
       end
 
+      OnForkShims.register
+
       @cli.binder.parse @options[:binds], self
     end
 
