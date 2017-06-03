@@ -102,6 +102,10 @@ module Puma
 
       @launcher.events.fire_on_booted!
 
+      Signal.trap "SIGINFO" do
+        server.log_thread_status
+      end
+
       begin
         server.run.join
       rescue Interrupt

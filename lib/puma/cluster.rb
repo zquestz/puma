@@ -264,6 +264,10 @@ module Puma
         server.stop
       end
 
+      Signal.trap "SIGINFO" do
+        server.log_thread_status
+      end
+
       begin
         @worker_write << "b#{Process.pid}\n"
       rescue SystemCallError, IOError

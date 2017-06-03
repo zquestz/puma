@@ -954,5 +954,16 @@ module Puma
     def shutting_down?
       @status == :stop || @status == :restart
     end
+
+    def log_thread_status
+      Thread.list.each do |thread|
+        @events.log "Thread TID-#{thread.object_id.to_s(36)} #{thread['label']}"
+        if thread.backtrace
+          @events.log thread.backtrace.join("\n")
+        else
+          @events.log "<no backtrace available>"
+        end
+      end
+    end
   end
 end
