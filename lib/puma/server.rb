@@ -235,7 +235,8 @@ module Puma
         STDERR.puts e.backtrace
       ensure
         @check.close
-        @notify.close
+        # Prevent can't modify frozen IOError (RuntimeError)
+        @notify.close rescue nil
 
         if @status != :restart and @own_binder
           @binder.close
